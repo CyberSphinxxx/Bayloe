@@ -1,5 +1,4 @@
-import { useState, useCallback } from 'react';
-import heic2any from 'heic2any';
+import { useState, useCallback, useRef, useEffect } from 'react';
 import jsPDF from 'jspdf';
 
 export type FileStatus = 'idle' | 'converting' | 'completed' | 'error';
@@ -14,8 +13,107 @@ export interface FileItem {
     errorMessage?: string;
 }
 
+// Helper to manage the isolation iframe
+class HeicConverter {
+    private iframe: HTMLIFrameElement | null = null;
+    private conversionCount = 0;
+    private readonly MAX_CONVERSIONS_PER_IFRAME = 5;
+
+    private async getIframe(): Promise<HTMLIFrameElement> {
+        if (this.iframe && this.conversionCount < this.MAX_CONVERSIONS_PER_IFRAME) {
+            return this.iframe;
+        }
+
+        // Recycle iframe
+        if (this.iframe) {
+            document.body.removeChild(this.iframe);
+            this.iframe = null;
+            // Small delay to allow GC
+            await new Promise(resolve => setTimeout(resolve, 100));
+        }
+
+        this.conversionCount = 0;
+        this.iframe = document.createElement('iframe');
+        this.iframe.style.display = 'none';
+        document.body.appendChild(this.iframe);
+
+        // Setup iframe content
+        const htmlContent = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <script src="/heic2any.js"></script>
+      </head>
+      <body>
+        <script>
+          window.onmessage = async function(e) {
+            try {
+              const { file, toType, quality } = e.data;
+              const result = await heic2any({
+                blob: file,
+                toType,
+                quality
+              });
+              // heic2any can return array or blob
+              const blob = Array.isArray(result) ? result[0] : result;
+              window.parent.postMessage({ success: true, blob }, '*');
+            } catch (error) {
+              window.parent.postMessage({ success: false, error: error.message || 'Unknown error' }, '*');
+            }
+          };
+        </script>
+      </body>
+      </html>
+    `;
+
+        this.iframe.contentWindow!.document.open();
+        this.iframe.contentWindow!.document.write(htmlContent);
+        this.iframe.contentWindow!.document.close();
+
+        // Wait for script to load (simple timeout for now, could be better)
+        await new Promise(resolve => setTimeout(resolve, 500));
+
+        return this.iframe;
+    }
+
+    public convert(file: File, toType: string, quality: number): Promise<Blob> {
+        return new Promise(async (resolve, reject) => {
+            try {
+                const iframe = await this.getIframe();
+
+                const handler = (e: MessageEvent) => {
+                    if (e.source !== iframe.contentWindow) return;
+
+                    window.removeEventListener('message', handler);
+                    this.conversionCount++;
+
+                    if (e.data.success) {
+                        resolve(e.data.blob);
+                    } else {
+                        reject(new Error(e.data.error));
+                    }
+                };
+
+                window.addEventListener('message', handler);
+
+                iframe.contentWindow!.postMessage({ file, toType, quality }, '*');
+            } catch (err) {
+                reject(err);
+            }
+        });
+    }
+}
+
 export const useConverter = () => {
     const [files, setFiles] = useState<FileItem[]>([]);
+    const converterRef = useRef<HeicConverter | null>(null);
+
+    useEffect(() => {
+        converterRef.current = new HeicConverter();
+        return () => {
+            // Cleanup logic if needed
+        };
+    }, []);
 
     const addFiles = useCallback((newFiles: File[]) => {
         const fileItems: FileItem[] = newFiles.map((file) => ({
@@ -46,16 +144,15 @@ export const useConverter = () => {
         let resultBlob: Blob;
 
         try {
-            // HEIC Conversion
+            // HEIC Conversion using Iframe Isolation
             if (fileItem.file.name.toLowerCase().endsWith('.heic') || fileItem.file.name.toLowerCase().endsWith('.heif')) {
-                const conversionResult = await heic2any({
-                    blob: fileItem.file,
-                    toType: fileItem.outputFormat === 'pdf' ? 'image/jpeg' : `image/${fileItem.outputFormat}`,
-                    quality: 0.9,
-                });
+                if (!converterRef.current) converterRef.current = new HeicConverter();
 
-                // Handle array result (should be single blob for single file)
-                resultBlob = Array.isArray(conversionResult) ? conversionResult[0] : conversionResult;
+                resultBlob = await converterRef.current.convert(
+                    fileItem.file,
+                    fileItem.outputFormat === 'pdf' ? 'image/jpeg' : `image/${fileItem.outputFormat}`,
+                    0.9
+                );
             } else {
                 // Standard Image Conversion
                 resultBlob = await new Promise<Blob>((resolve, reject) => {
